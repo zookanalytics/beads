@@ -9,13 +9,103 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// SearchIssuesInTx executes a filtered issue search within an existing transaction.
-// It queries the issues table, optionally merges wisps, and returns hydrated issues
-// with labels populated.
+// SearchIssuesInTx executes a filtered issue search within an existing
+// transaction and returns hydrated issues (labels, and optionally
+// dependencies via filter.IncludeDependencies). Routing, wisp-merge, and
+// overlap detection live in the shared searchInTx wrapper.
 func SearchIssuesInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter) ([]*types.Issue, error) {
+	return searchInTx(ctx, tx, query, filter, issueProjection)
+}
+
+// SearchIssueIDsInTx is the narrow-projection variant of SearchIssuesInTx:
+// applies the same WHERE clauses (label joins, wisp-merge semantics) but
+// projects only `id` and returns []string. Use when full row hydration is
+// wasted (e.g., partial-ID resolution in internal/utils/id_parser.go).
+func SearchIssueIDsInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter) ([]string, error) {
+	return searchInTx(ctx, tx, query, filter, idProjection)
+}
+
+// searchProjection describes how to project, scan, and dedup search results.
+// Adding a narrow-projection variant means adding a new projection literal —
+// not a parallel top-level function or wisp-merge wrapper, which is how the
+// two paths drifted historically.
+type searchProjection[T any] struct {
+	// columns returns the SELECT column expression. Receives FilterTables so
+	// projections can qualify identifiers with tables.Main when needed.
+	columns func(tables FilterTables) string
+	// scan reads one row into T.
+	scan func(*sql.Rows) (T, error)
+	// id returns the issue ID for dedup (within a single table) and wisp-merge
+	// overlap detection (across tables).
+	id func(T) string
+	// hydrate is invoked once per table after rows are scanned and the result
+	// set is closed (so we don't hold multiple active result sets on the same
+	// connection). nil for projections that don't need post-scan loading.
+	hydrate func(ctx context.Context, tx *sql.Tx, tables FilterTables, items []T, filter types.IssueFilter) error
+}
+
+var issueProjection = searchProjection[*types.Issue]{
+	columns: func(_ FilterTables) string { return IssueSelectColumns },
+	scan:    func(rows *sql.Rows) (*types.Issue, error) { return ScanIssueFrom(rows) },
+	id:      func(issue *types.Issue) string { return issue.ID },
+	hydrate: hydrateIssueLabelsAndDeps,
+}
+
+var idProjection = searchProjection[string]{
+	columns: func(tables FilterTables) string { return tables.Main + ".id" },
+	scan: func(rows *sql.Rows) (string, error) {
+		var id string
+		err := rows.Scan(&id)
+		return id, err
+	},
+	id:      func(id string) string { return id },
+	hydrate: nil,
+}
+
+// hydrateIssueLabelsAndDeps bulk-loads labels (and optionally dependencies)
+// for the given issues. searchTableInTxT runs against exactly one of the
+// issues/wisps tables, so every ID here belongs to tables.Labels — we use
+// GetLabelsForIssuesFromTableInTx and skip the per-batch wisp-partition
+// round-trip the generic GetLabelsForIssuesInTx performs (GH#3414).
+func hydrateIssueLabelsAndDeps(ctx context.Context, tx *sql.Tx, tables FilterTables, issues []*types.Issue, filter types.IssueFilter) error {
+	ids := make([]string, len(issues))
+	for i, issue := range issues {
+		ids[i] = issue.ID
+	}
+	if !filter.SkipLabels {
+		labelMap, err := GetLabelsForIssuesFromTableInTx(ctx, tx, tables.Labels, ids)
+		if err != nil {
+			return fmt.Errorf("hydrate labels: %w", err)
+		}
+		for _, issue := range issues {
+			if labels, ok := labelMap[issue.ID]; ok {
+				issue.Labels = labels
+			}
+		}
+	}
+
+	if filter.IncludeDependencies {
+		depMap, err := GetDependencyRecordsForIssuesFromTableInTx(ctx, tx, tables.Dependencies, ids)
+		if err != nil {
+			return fmt.Errorf("hydrate dependencies: %w", err)
+		}
+		for _, issue := range issues {
+			if deps, ok := depMap[issue.ID]; ok {
+				issue.Dependencies = deps
+			}
+		}
+	}
+	return nil
+}
+
+// searchInTx is the shared wisp-merge wrapper. Ephemeral routing, the
+// empty-wisps probe, the issues+wisps queries, and overlap detection live
+// here once. Both SearchIssuesInTx and SearchIssueIDsInTx use this body —
+// future projections pick up improvements (e.g., the empty-probe) for free.
+func searchInTx[T any](ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter, proj searchProjection[T]) ([]T, error) {
 	// Route ephemeral-only queries to wisps table.
 	if filter.Ephemeral != nil && *filter.Ephemeral {
-		results, err := searchTableInTx(ctx, tx, query, filter, WispsFilterTables)
+		results, err := searchTableInTxT(ctx, tx, query, filter, WispsFilterTables, proj)
 		if err != nil && !isTableNotExistError(err) {
 			return nil, fmt.Errorf("search wisps (ephemeral filter): %w", err)
 		}
@@ -25,7 +115,7 @@ func SearchIssuesInTx(ctx context.Context, tx *sql.Tx, query string, filter type
 		// Fall through: wisps table doesn't exist or returned no results
 	}
 
-	results, err := searchTableInTx(ctx, tx, query, filter, IssuesFilterTables)
+	results, err := searchTableInTxT(ctx, tx, query, filter, IssuesFilterTables, proj)
 	if err != nil {
 		return nil, fmt.Errorf("search issues: %w", err)
 	}
@@ -45,20 +135,21 @@ func SearchIssuesInTx(ctx context.Context, tx *sql.Tx, query string, filter type
 		if empty {
 			return results, nil
 		}
-		wispResults, wispErr := searchTableInTx(ctx, tx, query, filter, WispsFilterTables)
+		wispResults, wispErr := searchTableInTxT(ctx, tx, query, filter, WispsFilterTables, proj)
 		if wispErr != nil && !isTableNotExistError(wispErr) {
 			return nil, fmt.Errorf("search wisps (merge): %w", wispErr)
 		}
 		if len(wispResults) > 0 {
-			seen := make(map[string]bool, len(results))
-			for _, issue := range results {
-				seen[issue.ID] = true
+			seen := make(map[string]struct{}, len(results))
+			for _, r := range results {
+				seen[proj.id(r)] = struct{}{}
 			}
-			for _, issue := range wispResults {
-				if seen[issue.ID] {
-					return nil, fmt.Errorf("id %q exists in both issues and wisps", issue.ID)
+			for _, r := range wispResults {
+				id := proj.id(r)
+				if _, dup := seen[id]; dup {
+					return nil, fmt.Errorf("id %q exists in both issues and wisps", id)
 				}
-				results = append(results, issue)
+				results = append(results, r)
 			}
 		}
 	}
@@ -66,8 +157,9 @@ func SearchIssuesInTx(ctx context.Context, tx *sql.Tx, query string, filter type
 	return results, nil
 }
 
-// searchTableInTx runs a filtered search against a specific table set (issues or wisps).
-func searchTableInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter, tables FilterTables) ([]*types.Issue, error) {
+// searchTableInTxT runs a filtered search against a specific table set
+// (issues or wisps) under the given projection.
+func searchTableInTxT[T any](ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter, tables FilterTables, proj searchProjection[T]) ([]T, error) {
 	fromSQL, labelWhere, labelArgs, labelDriven, filterForClauses := buildLabelDrivenSearch(filter, tables)
 	whereClauses, args, err := BuildIssueFilterClauses(query, filterForClauses, tables)
 	if err != nil {
@@ -88,76 +180,46 @@ func searchTableInTx(ctx context.Context, tx *sql.Tx, query string, filter types
 		limitSQL = fmt.Sprintf(" LIMIT %d", filter.Limit)
 	}
 
-	selectSQL := "SELECT "
+	selectKeyword := "SELECT "
 	if labelDriven {
-		selectSQL = "SELECT DISTINCT "
+		selectKeyword = "SELECT DISTINCT "
 	}
 	//nolint:gosec // G201: SQL fragments are built from fixed table/column names and parameterized filters.
-	querySQL := fmt.Sprintf(`%s%s FROM %s %s ORDER BY priority ASC, created_at DESC, id ASC %s`,
-		selectSQL, IssueSelectColumns, fromSQL, whereSQL, limitSQL)
+	querySQL := fmt.Sprintf(`%s%s FROM %s %s ORDER BY %s.priority ASC, %s.created_at DESC, %s.id ASC %s`,
+		selectKeyword, proj.columns(tables), fromSQL, whereSQL, tables.Main, tables.Main, tables.Main, limitSQL)
 
 	rows, err := tx.QueryContext(ctx, querySQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search %s: %w", tables.Main, err)
 	}
 
-	var issues []*types.Issue
-	seen := make(map[string]bool)
+	var results []T
+	seen := make(map[string]struct{})
 	for rows.Next() {
-		issue, scanErr := ScanIssueFrom(rows)
+		item, scanErr := proj.scan(rows)
 		if scanErr != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("search %s: scan: %w", tables.Main, scanErr)
 		}
-		if seen[issue.ID] {
+		id := proj.id(item)
+		if _, dup := seen[id]; dup {
 			continue // GH#3567: skip duplicate rows from dependency subqueries
 		}
-		seen[issue.ID] = true
-		issues = append(issues, issue)
+		seen[id] = struct{}{}
+		results = append(results, item)
 	}
 	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("search %s: rows: %w", tables.Main, err)
 	}
 
-	// Hydrate labels in bulk after closing the result set, so we don't hold
-	// multiple active result sets on the same connection.
-	if len(issues) > 0 {
-		ids := make([]string, len(issues))
-		for i, issue := range issues {
-			ids[i] = issue.ID
-		}
-		if !filter.SkipLabels {
-			// Fast path: searchTableInTx queries exclusively either the issues
-			// or wisps table, so every ID in `ids` belongs to tables.Labels.
-			// Skip the per-batch wisp-partition round-trip that the generic
-			// GetLabelsForIssuesInTx performs (GH#3414).
-			labelMap, labelErr := GetLabelsForIssuesFromTableInTx(ctx, tx, tables.Labels, ids)
-			if labelErr != nil {
-				return nil, fmt.Errorf("search %s: hydrate labels: %w", tables.Main, labelErr)
-			}
-			for _, issue := range issues {
-				if labels, ok := labelMap[issue.ID]; ok {
-					issue.Labels = labels
-				}
-			}
-		}
-
-		// Optionally hydrate dependencies in bulk (same batched pattern as labels).
-		if filter.IncludeDependencies {
-			depMap, depErr := GetDependencyRecordsForIssuesFromTableInTx(ctx, tx, tables.Dependencies, ids)
-			if depErr != nil {
-				return nil, fmt.Errorf("search %s: hydrate dependencies: %w", tables.Main, depErr)
-			}
-			for _, issue := range issues {
-				if deps, ok := depMap[issue.ID]; ok {
-					issue.Dependencies = deps
-				}
-			}
+	if proj.hydrate != nil && len(results) > 0 {
+		if err := proj.hydrate(ctx, tx, tables, results, filter); err != nil {
+			return nil, fmt.Errorf("search %s: %w", tables.Main, err)
 		}
 	}
 
-	return issues, nil
+	return results, nil
 }
 
 func buildLabelDrivenSearch(filter types.IssueFilter, tables FilterTables) (string, []string, []interface{}, bool, types.IssueFilter) {
