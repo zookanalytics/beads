@@ -26,6 +26,10 @@ func (s *testSuite) SetupSuite() {
 
 func (s *testSuite) SetupTest() {
 	s.tmpDir = s.T().TempDir()
+	// Isolate from the user's global/system git config so lookups like
+	// GetConfig("beads.role") don't surface values set in ~/.gitconfig.
+	s.T().Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	s.T().Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
 	s.repo = NewGitRepository(s.tmpDir)
 }
 
