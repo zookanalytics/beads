@@ -105,6 +105,64 @@ func TestCheckRemoteConsistencyNoRemotesIncludesGitOriginAdoptionDetail(t *testi
 	}
 }
 
+func TestCheckRemoteConsistencyWarnsStrandedRootRemoteWithoutAutoFix(t *testing.T) {
+	clearResolveBeadsDirCache()
+	t.Cleanup(clearResolveBeadsDirCache)
+
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := (&configfile.Config{}).Save(beadsDir); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	// Simulate the wrong-directory case: a remote added at the dolt server root
+	// (.beads/dolt/) instead of the database subdir (.beads/dolt/beads/). Both
+	// dirs must look like dolt dirs for the migration guards to pass.
+	doltDir := filepath.Join(beadsDir, "dolt")
+	dbDir := filepath.Join(doltDir, "beads")
+	for _, d := range []string{filepath.Join(doltDir, ".dolt"), filepath.Join(dbDir, ".dolt")} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("failed to create %s: %v", d, err)
+		}
+	}
+
+	oldQuerySQLRemotes := querySQLRemotesForDoctor
+	oldListCLIRemotes := listCLIRemotesForDoctor
+	t.Cleanup(func() {
+		querySQLRemotesForDoctor = oldQuerySQLRemotes
+		listCLIRemotesForDoctor = oldListCLIRemotes
+	})
+	querySQLRemotesForDoctor = func(string) ([]storage.RemoteInfo, error) {
+		return nil, nil
+	}
+	listCLIRemotesForDoctor = func(dir string) ([]storage.RemoteInfo, error) {
+		if dir == doltDir {
+			return []storage.RemoteInfo{{Name: "origin", URL: "git+ssh://git@github.com/org/repo.git"}}, nil
+		}
+		return nil, nil
+	}
+
+	check := CheckRemoteConsistency(repoDir)
+	if check.Status != StatusWarning {
+		t.Fatalf("expected warning for stranded root remote, got %q: %s", check.Status, check.Message)
+	}
+	// Stranded root remotes are advisory only: --fix must not try to copy them
+	// into the configured database, because the intended database is ambiguous
+	// when the server root hosts multiple databases.
+	if check.Fix != "" {
+		t.Fatalf("expected empty Fix (warn-only) for stranded root remote, got %q\nDetail: %s", check.Fix, check.Detail)
+	}
+	if !strings.Contains(check.Detail, "stranded at server root") {
+		t.Fatalf("expected detail to mention the stranded remote, got:\n%s", check.Detail)
+	}
+	if !strings.Contains(check.Detail, "bd dolt remote add") {
+		t.Fatalf("expected detail to tell the user to add the remote explicitly, got:\n%s", check.Detail)
+	}
+}
+
 func TestRemoteAdoptionDetailWithoutGitOrigin(t *testing.T) {
 	detail := remoteAdoptionDetail(t.TempDir())
 	if !strings.Contains(detail, "bd dolt remote add origin <url>") {

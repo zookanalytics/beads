@@ -17,9 +17,17 @@ type remoteConsistencyContext struct {
 	cfg      *configfile.Config
 }
 
-// RemoteConsistency fixes remote discrepancies between SQL server and CLI.
-// For one-side-only remotes, it adds the missing side.
-// Conflicts (different URLs) are skipped — they require manual resolution.
+// RemoteConsistency fixes remote discrepancies between SQL server and CLI for
+// a single configured database. For one-side-only remotes, it adds the missing
+// side. Conflicts (different URLs) are skipped — they require manual resolution.
+//
+// It deliberately does NOT touch remotes stranded at the dolt server root
+// (.beads/dolt/ instead of .beads/dolt/<db>/): when the server root hosts more
+// than one database there is no reliable way to know which database a
+// root-level remote was meant for, so auto-copying it into the
+// currently-configured database could wire a project to the wrong remote.
+// CheckRemoteConsistency reports those as a warning telling the user to add
+// the remote to the intended project explicitly with `bd dolt remote add`.
 func RemoteConsistency(repoPath string) error {
 	ctx, err := resolveRemoteConsistencyContext(repoPath)
 	if err != nil {
