@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -61,8 +62,23 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 		}
 	}
 
-	// No remotes at all
-	if len(sqlRemotes) == 0 && len(cliRemotes) == 0 {
+	// Compare (convert to maps for O(1) lookup)
+	sqlMap := doltutil.ToRemoteNameMap(sqlRemotes)
+	cliMap := doltutil.ToRemoteNameMap(cliRemotes)
+
+	// Detect remotes stranded at the dolt server root (.beads/dolt/) instead of
+	// the database subdir (.beads/dolt/<db>/). They are invisible to both the
+	// SQL query and the CLI db-dir query above, so the wrong-directory case
+	// would otherwise report "No remotes configured". We surface them as a
+	// warning rather than auto-fixing: when the server root hosts multiple
+	// databases there is no reliable way to know which one a root-level remote
+	// was meant for, so copying it into the currently-configured database could
+	// wire this project to the wrong remote. The user resolves it by adding the
+	// remote to the intended project explicitly with `bd dolt remote add`.
+	stranded := strandedRootRemotes(doltDir, dbDir, cliMap)
+
+	// No remotes anywhere (including the server root)
+	if len(sqlRemotes) == 0 && len(cliRemotes) == 0 && len(stranded) == 0 {
 		return DoctorCheck{
 			Name:     "Remote Consistency",
 			Status:   StatusWarning,
@@ -71,10 +87,6 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 			Category: CategoryData,
 		}
 	}
-
-	// Compare (convert to maps for O(1) lookup)
-	sqlMap := doltutil.ToRemoteNameMap(sqlRemotes)
-	cliMap := doltutil.ToRemoteNameMap(cliRemotes)
 
 	var issues []string
 	hasConflict := false
@@ -97,7 +109,16 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 		}
 	}
 
-	if len(issues) == 0 {
+	// Remotes stranded at the server root are advisory-only: --fix never touches
+	// them (the intended database is ambiguous), so the user must act manually.
+	var strandedNotes []string
+	for _, r := range stranded {
+		strandedNotes = append(strandedNotes, fmt.Sprintf(
+			"%s: stranded at server root — not auto-fixed; add it to this project with 'bd dolt remote add %s %s'",
+			r.Name, r.Name, r.URL))
+	}
+
+	if len(issues) == 0 && len(strandedNotes) == 0 {
 		msg := fmt.Sprintf("%d remote(s) in sync", len(sqlRemotes))
 		// Add refs/dolt/data note for git+ssh remotes
 		for _, r := range sqlRemotes {
@@ -114,19 +135,51 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 		}
 	}
 
+	// Only SQL/CLI discrepancies are auto-fixable; stranded remotes never set Fix.
 	fix := ""
-	if !hasConflict {
+	if len(issues) > 0 && !hasConflict {
 		fix = "Run 'bd doctor --fix' to sync remotes"
 	}
 
+	allNotes := append(issues, strandedNotes...)
 	return DoctorCheck{
 		Name:     "Remote Consistency",
 		Status:   StatusWarning,
-		Message:  fmt.Sprintf("%d discrepancies found", len(issues)),
-		Detail:   strings.Join(issues, "\n"),
+		Message:  fmt.Sprintf("%d discrepancies found", len(allNotes)),
+		Detail:   strings.Join(allNotes, "\n"),
 		Fix:      fix,
 		Category: CategoryData,
 	}
+}
+
+// strandedRootRemotes returns remotes that live at the dolt server root
+// (doltDir) but are missing from the database subdir (dbDir) where the CLI
+// push/pull actually looks — the GH#2118 wrong-directory case. The guards
+// ensure both the root and the database dir are real dolt repos so we only
+// flag a remote the current project genuinely can't see; the caller surfaces
+// these as a warning (not an auto-fix), since the intended database is
+// ambiguous when the root hosts more than one.
+func strandedRootRemotes(doltDir, dbDir string, dbMap map[string]string) []storage.RemoteInfo {
+	if doltDir == "" || doltDir == dbDir {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(doltDir, ".dolt")); err != nil {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(dbDir, ".dolt")); err != nil {
+		return nil
+	}
+	rootRemotes, err := listCLIRemotesForDoctor(doltDir)
+	if err != nil {
+		return nil
+	}
+	var stranded []storage.RemoteInfo
+	for _, r := range rootRemotes {
+		if _, inDB := dbMap[r.Name]; !inDB {
+			stranded = append(stranded, r)
+		}
+	}
+	return stranded
 }
 
 func remoteAdoptionDetail(repoPath string) string {
