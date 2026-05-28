@@ -105,7 +105,7 @@ func TestCheckRemoteConsistencyNoRemotesIncludesGitOriginAdoptionDetail(t *testi
 	}
 }
 
-func TestCheckRemoteConsistencyFlagsStrandedRootRemote(t *testing.T) {
+func TestCheckRemoteConsistencyWarnsStrandedRootRemoteWithoutAutoFix(t *testing.T) {
 	clearResolveBeadsDirCache()
 	t.Cleanup(clearResolveBeadsDirCache)
 
@@ -149,11 +149,17 @@ func TestCheckRemoteConsistencyFlagsStrandedRootRemote(t *testing.T) {
 	if check.Status != StatusWarning {
 		t.Fatalf("expected warning for stranded root remote, got %q: %s", check.Status, check.Message)
 	}
-	if check.Fix == "" {
-		t.Fatalf("expected non-empty Fix so --fix reaches the migration, got empty Fix\nDetail: %s", check.Detail)
+	// Stranded root remotes are advisory only: --fix must not try to copy them
+	// into the configured database, because the intended database is ambiguous
+	// when the server root hosts multiple databases.
+	if check.Fix != "" {
+		t.Fatalf("expected empty Fix (warn-only) for stranded root remote, got %q\nDetail: %s", check.Fix, check.Detail)
 	}
 	if !strings.Contains(check.Detail, "stranded at server root") {
 		t.Fatalf("expected detail to mention the stranded remote, got:\n%s", check.Detail)
+	}
+	if !strings.Contains(check.Detail, "bd dolt remote add") {
+		t.Fatalf("expected detail to tell the user to add the remote explicitly, got:\n%s", check.Detail)
 	}
 }
 

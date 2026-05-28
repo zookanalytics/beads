@@ -68,10 +68,13 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 
 	// Detect remotes stranded at the dolt server root (.beads/dolt/) instead of
 	// the database subdir (.beads/dolt/<db>/). They are invisible to both the
-	// SQL query and the CLI db-dir query above, so without this the
-	// wrong-directory case reports "No remotes configured" with an empty Fix and
-	// --fix never reaches fix.RemoteConsistency (it only runs fixes for checks
-	// that expose a non-empty Fix), leaving migrateServerRootRemotes unreachable.
+	// SQL query and the CLI db-dir query above, so the wrong-directory case
+	// would otherwise report "No remotes configured". We surface them as a
+	// warning rather than auto-fixing: when the server root hosts multiple
+	// databases there is no reliable way to know which one a root-level remote
+	// was meant for, so copying it into the currently-configured database could
+	// wire this project to the wrong remote. The user resolves it by adding the
+	// remote to the intended project explicitly with `bd dolt remote add`.
 	stranded := strandedRootRemotes(doltDir, dbDir, cliMap)
 
 	// No remotes anywhere (including the server root)
@@ -106,12 +109,16 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 		}
 	}
 
-	// Remotes stranded at the server root: migratable by --fix.
+	// Remotes stranded at the server root are advisory-only: --fix never touches
+	// them (the intended database is ambiguous), so the user must act manually.
+	var strandedNotes []string
 	for _, r := range stranded {
-		issues = append(issues, fmt.Sprintf("%s: stranded at server root, not in database dir (%s)", r.Name, r.URL))
+		strandedNotes = append(strandedNotes, fmt.Sprintf(
+			"%s: stranded at server root — not auto-fixed; add it to this project with 'bd dolt remote add %s %s'",
+			r.Name, r.Name, r.URL))
 	}
 
-	if len(issues) == 0 {
+	if len(issues) == 0 && len(strandedNotes) == 0 {
 		msg := fmt.Sprintf("%d remote(s) in sync", len(sqlRemotes))
 		// Add refs/dolt/data note for git+ssh remotes
 		for _, r := range sqlRemotes {
@@ -128,16 +135,18 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 		}
 	}
 
+	// Only SQL/CLI discrepancies are auto-fixable; stranded remotes never set Fix.
 	fix := ""
-	if !hasConflict {
+	if len(issues) > 0 && !hasConflict {
 		fix = "Run 'bd doctor --fix' to sync remotes"
 	}
 
+	allNotes := append(issues, strandedNotes...)
 	return DoctorCheck{
 		Name:     "Remote Consistency",
 		Status:   StatusWarning,
-		Message:  fmt.Sprintf("%d discrepancies found", len(issues)),
-		Detail:   strings.Join(issues, "\n"),
+		Message:  fmt.Sprintf("%d discrepancies found", len(allNotes)),
+		Detail:   strings.Join(allNotes, "\n"),
 		Fix:      fix,
 		Category: CategoryData,
 	}
@@ -145,9 +154,11 @@ func CheckRemoteConsistency(repoPath string) DoctorCheck {
 
 // strandedRootRemotes returns remotes that live at the dolt server root
 // (doltDir) but are missing from the database subdir (dbDir) where the CLI
-// push/pull actually looks. This is the wrong-directory case that
-// fix.migrateServerRootRemotes repairs; the guards here mirror that migration
-// so the check only flags remotes the fix can actually move.
+// push/pull actually looks — the GH#2118 wrong-directory case. The guards
+// ensure both the root and the database dir are real dolt repos so we only
+// flag a remote the current project genuinely can't see; the caller surfaces
+// these as a warning (not an auto-fix), since the intended database is
+// ambiguous when the root hosts more than one.
 func strandedRootRemotes(doltDir, dbDir string, dbMap map[string]string) []storage.RemoteInfo {
 	if doltDir == "" || doltDir == dbDir {
 		return nil
