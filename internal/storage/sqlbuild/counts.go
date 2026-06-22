@@ -25,6 +25,22 @@ const DepJSONObject = `JSON_OBJECT(
 // reverse-blocker count unions wisp_dependencies only when the caller has
 // probed that the table exists.
 //
+// The WHERE filter is applied to the main table in an inner subquery, BEFORE
+// the aggregate LEFT JOINs. The filter only ever references issue columns (never
+// the aggregates) and the joins are all LEFT JOINs that preserve every main row,
+// so filtering before vs. after the joins yields the identical row set — but it
+// changes the plan Dolt picks: instead of materializing the
+// dep/rdep/comment/label/parent aggregates and joining them to every main row
+// before the WHERE prunes the result, the joins now drive off the
+// already-narrowed set. That is the win for the narrow ephemeral-work searches
+// that dominate the hot path.
+//
+// ORDER BY and LIMIT stay in their original position after the joins. Some
+// callers (the ready-work counts path) pass a parameterized ORDER BY, so it must
+// appear exactly once to keep the placeholder/arg counts aligned; and several
+// callers depend on the final SQL row order, which only a post-join ORDER BY
+// guarantees.
+//
 // The scan side is issueops.ScanReadyWorkRowWithCounts, which scans
 // IssueSelectColumns positionally followed by the six extra columns in the
 // order projected here.
@@ -61,7 +77,11 @@ func SearchCountsSQL(tables FilterTables, whereSQL, orderBySQL, limitSQL string,
 			COALESCE(cc.cnt, 0) AS comment_count,
 			pc.parent_id     AS parent_id,
 			d.deps_json      AS deps_json
-		FROM %s i
+		FROM (
+			SELECT i.*
+			FROM %s i
+			%s
+		) i
 		%s
 		LEFT JOIN (
 			SELECT issue_id, COUNT(*) AS cnt
@@ -93,11 +113,11 @@ func SearchCountsSQL(tables FilterTables, whereSQL, orderBySQL, limitSQL string,
 		) d ON d.issue_id = i.id
 		%s
 		%s
-		%s
 	`,
 		ReadyWorkIssueColumns,
 		labelsSelect,
 		tables.Main,
+		whereSQL,
 		labelsJoin,
 		tables.Dependencies,
 		reverseBlockerSelect,
@@ -105,7 +125,6 @@ func SearchCountsSQL(tables FilterTables, whereSQL, orderBySQL, limitSQL string,
 		tables.Dependencies,
 		DepJSONObject,
 		tables.Dependencies,
-		whereSQL,
 		orderBySQL,
 		limitSQL,
 	)

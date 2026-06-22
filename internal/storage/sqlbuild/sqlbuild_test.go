@@ -135,6 +135,33 @@ func TestSearchCountsSQLShape(t *testing.T) {
 		}
 	}
 
+	// Filter-before-join structure: the WHERE filter is applied to the main
+	// table in an inner subquery that closes before the first aggregate LEFT
+	// JOIN. Locking this prevents a regression back to the filter-after-join
+	// shape that materialized every aggregate before pruning.
+	subqEnd := strings.Index(sql, ") i")
+	firstJoin := strings.Index(sql, "LEFT JOIN")
+	if !strings.Contains(sql, "FROM (") || subqEnd < 0 {
+		t.Fatalf("counts SQL must wrap the main table in a derived subquery; got:\n%s", sql)
+	}
+	if firstJoin < 0 || subqEnd > firstJoin {
+		t.Fatalf("inner subquery must close before the first aggregate LEFT JOIN")
+	}
+	if idx := strings.Index(sql, "WHERE x = ?"); idx < 0 || idx > subqEnd {
+		t.Errorf("WHERE filter must appear inside the inner subquery (before %q)", ") i")
+	}
+	// ORDER BY and LIMIT must stay AFTER the joins, and appear exactly once —
+	// the ready-work path passes a parameterized ORDER BY, so duplicating it
+	// would desync the placeholder/arg counts.
+	for _, outer := range []string{"ORDER BY y", "LIMIT 5"} {
+		if strings.Count(sql, outer) != 1 {
+			t.Errorf("%q must appear exactly once, got %d", outer, strings.Count(sql, outer))
+		}
+		if idx := strings.Index(sql, outer); idx < firstJoin {
+			t.Errorf("%q must appear after the aggregate joins", outer)
+		}
+	}
+
 	noWispDeps := SearchCountsSQL(IssuesFilterTables, "", "", "", false, true)
 	if strings.Contains(noWispDeps, "UNION ALL") {
 		t.Error("counts SQL must not union wisp reverse deps when probe says absent")
