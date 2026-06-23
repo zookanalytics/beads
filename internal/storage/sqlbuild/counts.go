@@ -26,20 +26,23 @@ const DepJSONObject = `JSON_OBJECT(
 // probed that the table exists.
 //
 // The WHERE filter is applied to the main table in an inner subquery, BEFORE
-// the aggregate LEFT JOINs. The filter only ever references issue columns (never
-// the aggregates) and the joins are all LEFT JOINs that preserve every main row,
-// so filtering before vs. after the joins yields the identical row set — but it
-// changes the plan Dolt picks: instead of materializing the
+// the aggregate LEFT JOINs. The joins are all LEFT JOINs that preserve every
+// main row, so filtering before vs. after the joins yields the identical row
+// set — but it changes the plan Dolt picks: instead of materializing the
 // dep/rdep/comment/label/parent aggregates and joining them to every main row
 // before the WHERE prunes the result, the joins now drive off the
 // already-narrowed set. That is the win for the narrow ephemeral-work searches
 // that dominate the hot path.
 //
-// ORDER BY and LIMIT stay in their original position after the joins. Some
-// callers (the ready-work counts path) pass a parameterized ORDER BY, so it must
-// appear exactly once to keep the placeholder/arg counts aligned; and several
-// callers depend on the final SQL row order, which only a post-join ORDER BY
-// guarantees.
+// This shape REQUIRES that whereSQL reference only main-table columns (or
+// correlated subqueries against labels/deps/comments keyed by id) — never the
+// six aggregate aliases (labels_json, dep_count, rdep_count, comment_count,
+// parent_id, deps_json), which are projected by the OUTER query and are not in
+// scope inside the derived subquery. The only producers of whereSQL,
+// BuildIssueFilterClauses and BuildReadyWorkWhere, uphold this by construction;
+// TestWhereClausesNeverReferenceAggregates pins it. A future predicate that
+// violates it references an out-of-scope column, so Dolt errors at query time
+// rather than silently returning wrong rows — the failure is loud, not subtle.
 //
 // The scan side is issueops.ScanReadyWorkRowWithCounts, which scans
 // IssueSelectColumns positionally followed by the six extra columns in the
