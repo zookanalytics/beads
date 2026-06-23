@@ -87,8 +87,8 @@ type ReadyWorkWhereInputs struct {
 // subqueries keyed by id — never the counts mega-query's aggregate aliases
 // (labels_json, dep_count, rdep_count, comment_count, parent_id, deps_json).
 // SearchCountsSQL renders this WHERE inside a pre-join subquery where those
-// aliases are out of scope. See SearchCountsSQL and
-// TestWhereClausesNeverReferenceAggregates.
+// aliases are out of scope. See the SearchCountsSQL doc comment for why a
+// violation fails loud.
 func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyWorkWhereInputs) (string, []any, error) {
 	var statusClause string
 	if filter.Status != "" {

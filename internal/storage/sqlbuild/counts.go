@@ -39,10 +39,11 @@ const DepJSONObject = `JSON_OBJECT(
 // six aggregate aliases (labels_json, dep_count, rdep_count, comment_count,
 // parent_id, deps_json), which are projected by the OUTER query and are not in
 // scope inside the derived subquery. The only producers of whereSQL,
-// BuildIssueFilterClauses and BuildReadyWorkWhere, uphold this by construction;
-// TestWhereClausesNeverReferenceAggregates pins it. A future predicate that
-// violates it references an out-of-scope column, so Dolt errors at query time
-// rather than silently returning wrong rows — the failure is loud, not subtle.
+// BuildIssueFilterClauses and BuildReadyWorkWhere, uphold this by construction.
+// The invariant is self-enforcing: a predicate that referenced an aggregate
+// would reference an out-of-scope column, so Dolt errors at query time rather
+// than silently returning wrong rows — the failure is loud, not subtle. (The
+// subquery scoping that makes it loud is pinned by TestSearchCountsSQLShape.)
 //
 // The scan side is issueops.ScanReadyWorkRowWithCounts, which scans
 // IssueSelectColumns positionally followed by the six extra columns in the

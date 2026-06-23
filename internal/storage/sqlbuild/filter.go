@@ -20,7 +20,7 @@ import (
 // SearchCountsSQL renders this WHERE inside a pre-join subquery where those
 // aliases are out of scope; a count-driven predicate (e.g. "issues with >5
 // blockers") cannot live here and would need a separate outer predicate
-// parameter. See SearchCountsSQL and TestWhereClausesNeverReferenceAggregates.
+// parameter. See the SearchCountsSQL doc comment for why a violation fails loud.
 func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables FilterTables) ([]string, []any, error) {
 	var whereClauses []string
 	var args []any
