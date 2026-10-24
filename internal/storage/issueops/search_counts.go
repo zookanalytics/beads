@@ -130,13 +130,80 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 		limitSQL = fmt.Sprintf("LIMIT %d", eff)
 	}
 	orderBy := sqlbuild.OrderBy(filter.SortBy, filter.SortDesc, "i")
-	out, err := runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, hydrationFor(filter))
+	out, err := runSearchQueryByIDsInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, hydrationFor(filter))
 	if err != nil {
 		return nil, err
 	}
 	if goSideSort {
 		// scanCountsRowsInTx drops nil-Issue rows, so the accessor is safe.
 		out = goSideSortAndTrim(out, func(iwc *types.IssueWithCounts) string { return iwc.Issue.ID }, filter.SortDesc, eff)
+	}
+	return out, nil
+}
+
+// searchByIDsMaxRows is the largest match set runSearchQueryByIDsInTx
+// hydrates through the by-IDs form; a larger one is hydrated by the predicate
+// form, whose one statement costs less than that many id batches.
+const searchByIDsMaxRows = 10 * sqlbuild.QueryBatchSize
+
+// runSearchQueryByIDsInTx answers what runSearchQueryInTx answers in two
+// phases: the matching ids, in the query's order and bound, from the main
+// table alone, then the counts mega-query in its by-IDs form over those ids.
+// The predicate form aggregates its whole side tables (labels, parents, edges,
+// counts) whatever the WHERE selects; the by-IDs form aggregates only the
+// matched rows' entries, so a narrow match no longer pays for the ledger. Each
+// aggregate is a function of its own issue's rows, so the hydrated rows are
+// identical, and the order is restored from the id query.
+//
+//nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes
+func runSearchQueryByIDsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+	idQuery := fmt.Sprintf("SELECT i.id FROM %s i %s %s %s", tables.Main, whereSQL, orderBySQL, limitSQL)
+	rows, err := tx.QueryContext(ctx, idQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search ids %s: %w", tables.Main, err)
+	}
+	var ids []string
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("search ids %s: scan: %w", tables.Main, err)
+		}
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("search ids %s: rows: %w", tables.Main, err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(ids) > searchByIDsMaxRows {
+		return runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBySQL, limitSQL, args, includeWispReverseDeps, hyd)
+	}
+
+	byID := make(map[string]*types.IssueWithCounts, len(ids))
+	for start := 0; start < len(ids); start += sqlbuild.QueryBatchSize {
+		end := min(start+sqlbuild.QueryBatchSize, len(ids))
+		countsSQL, idArgs := sqlbuild.SearchCountsSQL(tables, ids[start:end], "", "", "", includeWispReverseDeps, hyd)
+		page, scanErr := scanCountsRowsInTx(ctx, tx, tables.Main, countsSQL, idArgs, hyd)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		for _, r := range page {
+			byID[r.Issue.ID] = r
+		}
+	}
+	out := make([]*types.IssueWithCounts, 0, len(ids))
+	for _, id := range ids {
+		if r, ok := byID[id]; ok {
+			out = append(out, r)
+		}
 	}
 	return out, nil
 }
